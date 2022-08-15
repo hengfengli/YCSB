@@ -60,14 +60,17 @@ public class CloudSpannerClient extends DB {
    * The names of properties which can be specified in the config files and flags.
    */
   public static final class CloudSpannerProperties {
-    private CloudSpannerProperties() {}
+    private CloudSpannerProperties() {
+    }
 
     /**
-     * The Cloud Spanner database name to use when running the YCSB benchmark, e.g. 'ycsb-database'.
+     * The Cloud Spanner database name to use when running the YCSB benchmark, e.g.
+     * 'ycsb-database'.
      */
     static final String DATABASE = "cloudspanner.database";
     /**
-     * The Cloud Spanner instance ID to use when running the YCSB benchmark, e.g. 'ycsb-instance'.
+     * The Cloud Spanner instance ID to use when running the YCSB benchmark, e.g.
+     * 'ycsb-instance'.
      */
     static final String INSTANCE = "cloudspanner.instance";
     /**
@@ -75,12 +78,14 @@ public class CloudSpannerClient extends DB {
      */
     static final String READ_MODE = "cloudspanner.readmode";
     /**
-     * The number of inserts to batch during the bulk loading phase. The default value is 1, which means no batching
+     * The number of inserts to batch during the bulk loading phase. The default
+     * value is 1, which means no batching
      * is done. Recommended value during data load is 1000.
      */
     static final String BATCH_INSERTS = "cloudspanner.batchinserts";
     /**
-     * Number of seconds we allow reads to be stale for. Set to 0 for strong reads (default).
+     * Number of seconds we allow reads to be stale for. Set to 0 for strong reads
+     * (default).
      * For performance gains, this should be set to 10 seconds.
      */
     static final String BOUNDED_STALENESS = "cloudspanner.boundedstaleness";
@@ -88,7 +93,8 @@ public class CloudSpannerClient extends DB {
     // The properties below usually do not need to be set explicitly.
 
     /**
-     * The Cloud Spanner project ID to use when running the YCSB benchmark, e.g. 'myproject'. This is not strictly
+     * The Cloud Spanner project ID to use when running the YCSB benchmark, e.g.
+     * 'myproject'. This is not strictly
      * necessary and can often be inferred from the environment.
      */
     static final String PROJECT = "cloudspanner.project";
@@ -97,10 +103,24 @@ public class CloudSpannerClient extends DB {
      */
     static final String HOST = "cloudspanner.host";
     /**
-     * Number of Cloud Spanner client channels to use. It's recommended to leave this to be the default value.
+     * Number of Cloud Spanner client channels to use. It's recommended to leave
+     * this to be the default value.
      */
     static final String NUM_CHANNELS = "cloudspanner.channels";
   }
+
+  /**
+   * The names of different SQL dialects supported by Spanner.
+   * "Dialect" is a per-database property. Each database understands
+   * a specific SQL dialect, but any two databases may understand
+   * different dialects.
+   */
+  public enum DatabaseDialect {
+    GOOGLE_STANDARD_SQL,
+    POSTGRESQL,
+  }
+
+  private static DatabaseDialect databaseDialect;
 
   private static int fieldCount;
 
@@ -133,16 +153,46 @@ public class CloudSpannerClient extends DB {
   // Note that we have a separate CloudSpannerClient object per thread.
   private final ArrayList<Mutation> bufferedMutations = new ArrayList<>();
 
-  private static void constructStandardQueriesAndFields(Properties properties) {
+  private static void constructStandardQueriesAndFields(Properties properties) throws DBException {
     String table = properties.getProperty(CoreWorkload.TABLENAME_PROPERTY, CoreWorkload.TABLENAME_PROPERTY_DEFAULT);
     final String fieldprefix = properties.getProperty(CoreWorkload.FIELD_NAME_PREFIX,
-                                                      CoreWorkload.FIELD_NAME_PREFIX_DEFAULT);
-    standardQuery = new StringBuilder()
-        .append("SELECT * FROM ").append(table).append(" WHERE id=@key").toString();
-    standardScan = new StringBuilder()
-        .append("SELECT * FROM ").append(table).append(" WHERE id>=@startKey LIMIT @count").toString();
+        CoreWorkload.FIELD_NAME_PREFIX_DEFAULT);
+
+    if (databaseDialect == DatabaseDialect.GOOGLE_STANDARD_SQL) {
+      standardQuery = new StringBuilder()
+          .append("SELECT * FROM ").append(table).append(" WHERE id=@key").toString();
+      standardScan = new StringBuilder()
+          .append("SELECT * FROM ").append(table).append(" WHERE id>=@startKey LIMIT @count").toString();
+    } else if (databaseDialect == DatabaseDialect.POSTGRESQL) {
+      standardQuery = new StringBuilder()
+          .append("SELECT * FROM ").append(table).append(" WHERE id=$1").toString();
+      standardScan = new StringBuilder()
+          .append("SELECT * FROM ").append(table).append(" WHERE id>=$1 LIMIT $2").toString();
+    } else {
+      throw new DBException("Unknown dialect: " + databaseDialect.toString());
+    }
+
     for (int i = 0; i < fieldCount; i++) {
       STANDARD_FIELDS.add(fieldprefix + i);
+    }
+  }
+
+  private static DatabaseDialect getDatabaseDialect() {
+    String getDialectQuery = "select option_value from information_schema.database_options "
+        + "where option_name = 'database_dialect'";
+
+    Statement query = Statement.newBuilder(getDialectQuery).build();
+
+    try (ResultSet resultSet = dbClient.singleUse(timestampBound).executeQuery(query)) {
+      resultSet.next();
+      return DatabaseDialect.valueOf(resultSet.getString("option_value"));
+    } catch (Exception e) {
+      LOGGER.log(Level.INFO, "getDatabaseDialect()", e);
+
+      // Default to Google Standard SQL
+      // in case of old installations (for example with the Emulator) that
+      // don't specify a dialect.
+      return DatabaseDialect.GOOGLE_STANDARD_SQL;
     }
   }
 
@@ -155,7 +205,8 @@ public class CloudSpannerClient extends DB {
     SpannerOptions.Builder optionsBuilder = SpannerOptions.newBuilder()
         .setSessionPoolOption(SessionPoolOptions.newBuilder()
             .setMinSessions(numThreads)
-            // Since we have no read-write transactions, we can set the write session fraction to 0.
+            // Since we have no read-write transactions, we can set the write session
+            // fraction to 0.
             .setWriteSessionsFraction(0)
             .build());
     if (host != null) {
@@ -169,11 +220,11 @@ public class CloudSpannerClient extends DB {
     }
     spanner = optionsBuilder.build().getService();
     Runtime.getRuntime().addShutdownHook(new Thread("spannerShutdown") {
-        @Override
-        public void run() {
-          spanner.close();
-        }
-      });
+      @Override
+      public void run() {
+        spanner.close();
+      }
+    });
     return spanner;
   }
 
@@ -193,12 +244,12 @@ public class CloudSpannerClient extends DB {
           CoreWorkload.FIELD_COUNT_PROPERTY, CoreWorkload.FIELD_COUNT_PROPERTY_DEFAULT));
       queriesForReads = properties.getProperty(CloudSpannerProperties.READ_MODE, "query").equals("query");
       batchInserts = Integer.parseInt(properties.getProperty(CloudSpannerProperties.BATCH_INSERTS, "1"));
-      constructStandardQueriesAndFields(properties);
+      // constructStandardQueriesAndFields(properties);
 
       int boundedStalenessSeconds = Integer.parseInt(properties.getProperty(
           CloudSpannerProperties.BOUNDED_STALENESS, "0"));
-      timestampBound = (boundedStalenessSeconds <= 0) ?
-          TimestampBound.strong() : TimestampBound.ofMaxStaleness(boundedStalenessSeconds, TimeUnit.SECONDS);
+      timestampBound = (boundedStalenessSeconds <= 0) ? TimestampBound.strong()
+          : TimestampBound.ofMaxStaleness(boundedStalenessSeconds, TimeUnit.SECONDS);
 
       try {
         spanner = getSpanner(properties, host, project);
@@ -210,6 +261,9 @@ public class CloudSpannerClient extends DB {
         LOGGER.log(Level.SEVERE, "init()", e);
         throw new DBException(e);
       }
+
+      databaseDialect = getDatabaseDialect();
+      constructStandardQueriesAndFields(properties);
 
       LOGGER.log(Level.INFO, new StringBuilder()
           .append("\nHost: ").append(spanner.getOptions().getHost())
@@ -224,26 +278,44 @@ public class CloudSpannerClient extends DB {
   }
 
   private Status readUsingQuery(
-      String table, String key, Set<String> fields, Map<String, ByteIterator> result) {
+      String table, String key, Set<String> fields, Map<String, ByteIterator> result) throws DBException {
     Statement query;
     Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
     if (fields == null || fields.size() == fieldCount) {
-      query = Statement.newBuilder(standardQuery).bind("key").to(key).build();
+      if (databaseDialect == DatabaseDialect.GOOGLE_STANDARD_SQL) {
+        query = Statement.newBuilder(standardQuery).bind("key").to(key).build();
+      } else if (databaseDialect == DatabaseDialect.POSTGRESQL) {
+        query = Statement.newBuilder(standardQuery).bind("p1").to(key).build();
+      } else {
+        throw new DBException("Unknown dialect: " + databaseDialect.toString());
+      }
     } else {
       Joiner joiner = Joiner.on(',');
-      query = Statement.newBuilder("SELECT ")
-          .append(joiner.join(fields))
-          .append(" FROM ")
-          .append(table)
-          .append(" WHERE id=@key")
-          .bind("key").to(key)
-          .build();
+      if (databaseDialect == DatabaseDialect.GOOGLE_STANDARD_SQL) {
+        query = Statement.newBuilder("SELECT ")
+            .append(joiner.join(fields))
+            .append(" FROM ")
+            .append(table)
+            .append(" WHERE id=@key")
+            .bind("key").to(key)
+            .build();
+      } else if (databaseDialect == DatabaseDialect.POSTGRESQL) {
+        query = Statement.newBuilder("SELECT ")
+            .append(joiner.join(fields))
+            .append(" FROM ")
+            .append(table)
+            .append(" WHERE id=$1")
+            .bind("p1").to(key)
+            .build();
+      } else {
+        throw new DBException("Unknown dialect: " + databaseDialect.toString());
+      }
     }
     try (ResultSet resultSet = dbClient.singleUse(timestampBound).executeQuery(query)) {
       resultSet.next();
       decodeStruct(columns, resultSet, result);
       if (resultSet.next()) {
-        throw new Exception("Expected exactly one row for each read.");
+        throw new DBException("Expected exactly one row for each read.");
       }
 
       return Status.OK;
@@ -257,7 +329,12 @@ public class CloudSpannerClient extends DB {
   public Status read(
       String table, String key, Set<String> fields, Map<String, ByteIterator> result) {
     if (queriesForReads) {
-      return readUsingQuery(table, key, fields, result);
+      try {
+        return readUsingQuery(table, key, fields, result);
+      } catch (DBException e) {
+        LOGGER.log(Level.INFO, "read()", e);
+        return Status.ERROR;
+      }
     }
     Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
     try {
@@ -272,21 +349,40 @@ public class CloudSpannerClient extends DB {
 
   private Status scanUsingQuery(
       String table, String startKey, int recordCount, Set<String> fields,
-      Vector<HashMap<String, ByteIterator>> result) {
+      Vector<HashMap<String, ByteIterator>> result) throws DBException {
     Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
     Statement query;
     if (fields == null || fields.size() == fieldCount) {
-      query = Statement.newBuilder(standardScan).bind("startKey").to(startKey).bind("count").to(recordCount).build();
+      if (databaseDialect == DatabaseDialect.GOOGLE_STANDARD_SQL) {
+        query = Statement.newBuilder(standardScan).bind("startKey").to(startKey).bind("count").to(recordCount).build();
+      } else if (databaseDialect == DatabaseDialect.POSTGRESQL) {
+        query = Statement.newBuilder(standardScan).bind("p1").to(startKey).bind("p2").to(recordCount).build();
+      } else {
+        throw new DBException("Unknown dialect: " + databaseDialect.toString());
+      }
     } else {
       Joiner joiner = Joiner.on(',');
-      query = Statement.newBuilder("SELECT ")
-          .append(joiner.join(fields))
-          .append(" FROM ")
-          .append(table)
-          .append(" WHERE id>=@startKey LIMIT @count")
-          .bind("startKey").to(startKey)
-          .bind("count").to(recordCount)
-          .build();
+      if (databaseDialect == DatabaseDialect.GOOGLE_STANDARD_SQL) {
+        query = Statement.newBuilder("SELECT ")
+            .append(joiner.join(fields))
+            .append(" FROM ")
+            .append(table)
+            .append(" WHERE id>=@startKey LIMIT @count")
+            .bind("startKey").to(startKey)
+            .bind("count").to(recordCount)
+            .build();
+      } else if (databaseDialect == DatabaseDialect.POSTGRESQL) {
+        query = Statement.newBuilder("SELECT ")
+            .append(joiner.join(fields))
+            .append(" FROM ")
+            .append(table)
+            .append(" WHERE id>=$1 LIMIT $2")
+            .bind("p1").to(startKey)
+            .bind("p2").to(recordCount)
+            .build();
+      } else {
+        throw new DBException("Unknown dialect: " + databaseDialect.toString());
+      }
     }
     try (ResultSet resultSet = dbClient.singleUse(timestampBound).executeQuery(query)) {
       while (resultSet.next()) {
@@ -306,13 +402,17 @@ public class CloudSpannerClient extends DB {
       String table, String startKey, int recordCount, Set<String> fields,
       Vector<HashMap<String, ByteIterator>> result) {
     if (queriesForReads) {
-      return scanUsingQuery(table, startKey, recordCount, fields, result);
+      try {
+        return scanUsingQuery(table, startKey, recordCount, fields, result);
+      } catch (DBException e) {
+        LOGGER.log(Level.INFO, "scan()", e);
+        return Status.ERROR;
+      }
     }
     Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
-    KeySet keySet =
-        KeySet.newBuilder().addRange(KeyRange.closedClosed(Key.of(startKey), Key.of())).build();
+    KeySet keySet = KeySet.newBuilder().addRange(KeyRange.closedClosed(Key.of(startKey), Key.of())).build();
     try (ResultSet resultSet = dbClient.singleUse(timestampBound)
-                                       .read(table, keySet, columns, Options.limit(recordCount))) {
+        .read(table, keySet, columns, Options.limit(recordCount))) {
       while (resultSet.next()) {
         HashMap<String, ByteIterator> row = new HashMap<>();
         decodeStruct(columns, resultSet, row);
