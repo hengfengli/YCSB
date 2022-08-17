@@ -43,6 +43,8 @@ import site.ycsb.workloads.CoreWorkload;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -77,6 +79,14 @@ public class CloudSpannerClient extends DB {
      * Choose between 'read' and 'query'. Affects both read() and scan() operations.
      */
     static final String READ_MODE = "cloudspanner.readmode";
+    /**
+     * Choose between 'update' and 'dml'. Affects update() operations.
+     */
+    static final String UPDATE_MODE = "cloudspanner.updatemode";
+    /**
+     * Choose between 'insert' and 'dml'. Affects insert() operations.
+     */
+    static final String INSERT_MODE = "cloudspanner.insertmode";
     /**
      * The number of inserts to batch during the bulk loading phase. The default
      * value is 1, which means no batching
@@ -126,6 +136,10 @@ public class CloudSpannerClient extends DB {
 
   private static boolean queriesForReads;
 
+  private static boolean dmlForUpdates;
+
+  private static boolean dmlForInserts;
+
   private static int batchInserts;
 
   private static TimestampBound timestampBound;
@@ -152,6 +166,11 @@ public class CloudSpannerClient extends DB {
   // Buffered mutations on a per object/thread basis for batch inserts.
   // Note that we have a separate CloudSpannerClient object per thread.
   private final ArrayList<Mutation> bufferedMutations = new ArrayList<>();
+
+  // Buffered statements on a per object/thread basis for batch inserts.
+  // Note that we have a separate CloudSpannerClient object per thread.
+  // This is only used when dmlForInserts is true.
+  private final List<Statement> bufferedDMLs = new ArrayList<>();
 
   private static void constructStandardQueriesAndFields(Properties properties) throws DBException {
     String table = properties.getProperty(CoreWorkload.TABLENAME_PROPERTY, CoreWorkload.TABLENAME_PROPERTY_DEFAULT);
@@ -243,6 +262,8 @@ public class CloudSpannerClient extends DB {
       fieldCount = Integer.parseInt(properties.getProperty(
           CoreWorkload.FIELD_COUNT_PROPERTY, CoreWorkload.FIELD_COUNT_PROPERTY_DEFAULT));
       queriesForReads = properties.getProperty(CloudSpannerProperties.READ_MODE, "query").equals("query");
+      dmlForUpdates = properties.getProperty(CloudSpannerProperties.UPDATE_MODE, "update").equals("dml");
+      dmlForInserts = properties.getProperty(CloudSpannerProperties.INSERT_MODE, "insert").equals("dml");
       batchInserts = Integer.parseInt(properties.getProperty(CloudSpannerProperties.BATCH_INSERTS, "1"));
       // constructStandardQueriesAndFields(properties);
 
@@ -271,6 +292,8 @@ public class CloudSpannerClient extends DB {
           .append("\nInstance: ").append(instance)
           .append("\nDatabase: ").append(database)
           .append("\nUsing queries for reads: ").append(queriesForReads)
+          .append("\nUsing dml for updates: ").append(dmlForUpdates)
+          .append("\nUsing dml for inserts: ").append(dmlForInserts)
           .append("\nBatching inserts: ").append(batchInserts)
           .append("\nBounded staleness seconds: ").append(boundedStalenessSeconds)
           .toString());
@@ -425,8 +448,83 @@ public class CloudSpannerClient extends DB {
     }
   }
 
+  private Statement buildGoogleSQLUpdateDML(String table, String key, Map<String, ByteIterator> values) {
+    Statement.Builder builder;
+    Joiner joiner = Joiner.on(',');
+    Set<String> updatedFields = new HashSet<>();
+    for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
+      updatedFields.add(e.getKey() + "=@" + e.getKey());
+    }
+    builder = Statement.newBuilder("UPDATE ")
+        .append(table)
+        .append(" SET ")
+        .append(joiner.join(updatedFields))
+        .append(" WHERE id=@key")
+        .bind("key").to(key);
+    for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
+      builder.bind(e.getKey()).to(e.getValue().toString());
+    }
+    return builder.build();
+  }
+
+  private Statement buildPostgreSQLUpdateDML(String table, String key, Map<String, ByteIterator> values) {
+    Statement.Builder builder;
+    Joiner joiner = Joiner.on(',');
+    List<String> updatedFields = new ArrayList<>();
+    List<String> updatedValues = new ArrayList<>();
+    int startIndex = 2;
+    for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
+      updatedFields.add(e.getKey() + "=$" + startIndex);
+      updatedValues.add(e.getValue().toString());
+      startIndex++;
+    }
+    builder = Statement.newBuilder("UPDATE ")
+        .append(table)
+        .append(" SET ")
+        .append(joiner.join(updatedFields))
+        .append(" WHERE id=$1")
+        .bind("p1").to(key);
+    startIndex = 2;
+    for (String s : updatedValues) {
+      builder.bind("p" + startIndex).to(s);
+      startIndex++;
+    }
+    return builder.build();
+  }
+
+  private Status updateUsingDML(String table, String key, Map<String, ByteIterator> values) throws DBException {
+    Statement dml;
+    if (databaseDialect == DatabaseDialect.GOOGLE_STANDARD_SQL) {
+      dml = buildGoogleSQLUpdateDML(table, key, values);
+    } else if (databaseDialect == DatabaseDialect.POSTGRESQL) {
+      dml = buildPostgreSQLUpdateDML(table, key, values);
+    } else {
+      throw new DBException("Unknown dialect: " + databaseDialect.toString());
+    }
+    try {
+      dbClient
+          .readWriteTransaction()
+          .run(transaction -> {
+              transaction.executeUpdate(dml);
+              return null;
+            });
+      return Status.OK;
+    } catch (Exception e) {
+      LOGGER.log(Level.INFO, "updateUsingDML()", e);
+      return Status.ERROR;
+    }
+  }
+
   @Override
   public Status update(String table, String key, Map<String, ByteIterator> values) {
+    if (dmlForUpdates) {
+      try {
+        return updateUsingDML(table, key, values);
+      } catch (DBException e) {
+        LOGGER.log(Level.INFO, "update()", e);
+        return Status.ERROR;
+      }
+    }
     Mutation.WriteBuilder m = Mutation.newInsertOrUpdateBuilder(table);
     m.set(PRIMARY_KEY_COLUMN).to(key);
     for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
@@ -441,8 +539,93 @@ public class CloudSpannerClient extends DB {
     return Status.OK;
   }
 
+  private Statement buildGoogleSQLInsertDML(String table, String key, Map<String, ByteIterator> values) {
+    Statement.Builder builder;
+    Joiner joiner = Joiner.on(',');
+    Set<String> updatedFields = new HashSet<>();
+    for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
+      updatedFields.add("@" + e.getKey());
+    }
+    builder = Statement.newBuilder("INSERT INTO ")
+        .append(table)
+        .append(" (" + PRIMARY_KEY_COLUMN + ",")
+        .append(joiner.join(values.keySet()) + ") ")
+        .append("VALUES (@key, ")
+        .append(joiner.join(updatedFields) + ") ")
+        .bind("key").to(key);
+    for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
+      builder.bind(e.getKey()).to(e.getValue().toString());
+    }
+    return builder.build();
+  }
+
+  private Statement buildPostgreSQLInsertDML(String table, String key, Map<String, ByteIterator> values) {
+    Statement.Builder builder;
+    Joiner joiner = Joiner.on(',');
+    List<String> updatedFields = new ArrayList<>();
+    List<String> updatedValues = new ArrayList<>();
+    int startIndex = 2;
+    for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
+      updatedFields.add("$" + startIndex);
+      updatedValues.add(e.getValue().toString());
+      startIndex++;
+    }
+    builder = Statement.newBuilder("INSERT INTO ")
+        .append(table)
+        .append(" (" + PRIMARY_KEY_COLUMN + ",")
+        .append(joiner.join(values.keySet()) + ") ")
+        .append("VALUES ($1, ")
+        .append(joiner.join(updatedFields) + ") ")
+        .bind("p1").to(key);
+    startIndex = 2;
+    for (String s : updatedValues) {
+      builder.bind("p" + startIndex).to(s);
+      startIndex++;
+    }
+    return builder.build();
+  }
+
+  private Status insertUsingDML(String table, String key, Map<String, ByteIterator> values) throws DBException {
+    if (bufferedDMLs.size() < batchInserts) {
+      if (databaseDialect == DatabaseDialect.GOOGLE_STANDARD_SQL) {
+        bufferedDMLs.add(buildGoogleSQLInsertDML(table, key, values));
+      } else if (databaseDialect == DatabaseDialect.POSTGRESQL) {
+        bufferedDMLs.add(buildPostgreSQLInsertDML(table, key, values));
+      } else {
+        throw new DBException("Unknown dialect: " + databaseDialect.toString());
+      }
+    } else {
+      LOGGER.log(Level.INFO, "Limit of cached dmls reached. The given mutation with key " + key +
+          " is ignored. Is this a retry?");
+    }
+    if (bufferedDMLs.size() < batchInserts) {
+      return Status.BATCHED_OK;
+    }
+    try {
+      dbClient
+          .readWriteTransaction()
+          .run(transaction -> {
+              transaction.batchUpdate(bufferedDMLs);
+              return null;
+            });
+      bufferedDMLs.clear();
+      return Status.OK;
+    } catch (Exception e) {
+      LOGGER.log(Level.INFO, "insertUsingDML()", e);
+      return Status.ERROR;
+    }
+  }
+
   @Override
   public Status insert(String table, String key, Map<String, ByteIterator> values) {
+    if (dmlForInserts) {
+      try {
+        return insertUsingDML(table, key, values);
+      } catch (DBException e) {
+        LOGGER.log(Level.INFO, "insert()", e);
+        return Status.ERROR;
+      }
+    }
     if (bufferedMutations.size() < batchInserts) {
       Mutation.WriteBuilder m = Mutation.newInsertOrUpdateBuilder(table);
       m.set(PRIMARY_KEY_COLUMN).to(key);
