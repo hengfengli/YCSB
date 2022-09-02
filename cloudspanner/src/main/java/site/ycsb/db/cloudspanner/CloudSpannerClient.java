@@ -144,8 +144,6 @@ public class CloudSpannerClient extends DB {
 
   private static TimestampBound timestampBound;
 
-  private static String standardQuery;
-
   private static String standardScan;
 
   private static final ArrayList<String> STANDARD_FIELDS = new ArrayList<>();
@@ -178,13 +176,9 @@ public class CloudSpannerClient extends DB {
         CoreWorkload.FIELD_NAME_PREFIX_DEFAULT);
 
     if (databaseDialect == DatabaseDialect.GOOGLE_STANDARD_SQL) {
-      standardQuery = new StringBuilder()
-          .append("SELECT * FROM ").append(table).append(" WHERE id=@key").toString();
       standardScan = new StringBuilder()
           .append("SELECT * FROM ").append(table).append(" WHERE id>=@startKey LIMIT @count").toString();
     } else if (databaseDialect == DatabaseDialect.POSTGRESQL) {
-      standardQuery = new StringBuilder()
-          .append("SELECT * FROM ").append(table).append(" WHERE id=$1").toString();
       standardScan = new StringBuilder()
           .append("SELECT * FROM ").append(table).append(" WHERE id>=$1 LIMIT $2").toString();
     } else {
@@ -305,34 +299,18 @@ public class CloudSpannerClient extends DB {
     Statement query;
     Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
     if (fields == null || fields.size() == fieldCount) {
-      if (databaseDialect == DatabaseDialect.GOOGLE_STANDARD_SQL) {
-        query = Statement.newBuilder(standardQuery).bind("key").to(key).build();
-      } else if (databaseDialect == DatabaseDialect.POSTGRESQL) {
-        query = Statement.newBuilder(standardQuery).bind("p1").to(key).build();
-      } else {
-        throw new DBException("Unknown dialect: " + databaseDialect.toString());
-      }
+      query = Statement.newBuilder("SELECT * FROM ")
+          .append(table)
+          .append(String.format(" WHERE id='%s'", key))
+          .build();
     } else {
       Joiner joiner = Joiner.on(',');
-      if (databaseDialect == DatabaseDialect.GOOGLE_STANDARD_SQL) {
-        query = Statement.newBuilder("SELECT ")
-            .append(joiner.join(fields))
-            .append(" FROM ")
-            .append(table)
-            .append(" WHERE id=@key")
-            .bind("key").to(key)
-            .build();
-      } else if (databaseDialect == DatabaseDialect.POSTGRESQL) {
-        query = Statement.newBuilder("SELECT ")
-            .append(joiner.join(fields))
-            .append(" FROM ")
-            .append(table)
-            .append(" WHERE id=$1")
-            .bind("p1").to(key)
-            .build();
-      } else {
-        throw new DBException("Unknown dialect: " + databaseDialect.toString());
-      }
+      query = Statement.newBuilder("SELECT ")
+          .append(joiner.join(fields))
+          .append(" FROM ")
+          .append(table)
+          .append(String.format(" WHERE id='%s'", key))
+          .build();
     }
     try (ResultSet resultSet = dbClient.singleUse(timestampBound).executeQuery(query)) {
       resultSet.next();
@@ -453,17 +431,16 @@ public class CloudSpannerClient extends DB {
     Joiner joiner = Joiner.on(',');
     Set<String> updatedFields = new HashSet<>();
     for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
-      updatedFields.add(e.getKey() + "=@" + e.getKey());
+      String escapedValue = e.getValue().toString()
+          .replace("\\", "\\\\")
+          .replace("'", "\\'");
+      updatedFields.add(String.format("%s='%s'", e.getKey(), escapedValue));
     }
     builder = Statement.newBuilder("UPDATE ")
         .append(table)
         .append(" SET ")
         .append(joiner.join(updatedFields))
-        .append(" WHERE id=@key")
-        .bind("key").to(key);
-    for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
-      builder.bind(e.getKey()).to(e.getValue().toString());
-    }
+        .append(String.format(" WHERE id='%s'", key));
     return builder.build();
   }
 
@@ -471,24 +448,14 @@ public class CloudSpannerClient extends DB {
     Statement.Builder builder;
     Joiner joiner = Joiner.on(',');
     List<String> updatedFields = new ArrayList<>();
-    List<String> updatedValues = new ArrayList<>();
-    int startIndex = 2;
     for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
-      updatedFields.add(e.getKey() + "=$" + startIndex);
-      updatedValues.add(e.getValue().toString());
-      startIndex++;
+      updatedFields.add(String.format("%s='%s'", e.getKey(), e.getValue().toString().replace("'", "''")));
     }
     builder = Statement.newBuilder("UPDATE ")
         .append(table)
         .append(" SET ")
         .append(joiner.join(updatedFields))
-        .append(" WHERE id=$1")
-        .bind("p1").to(key);
-    startIndex = 2;
-    for (String s : updatedValues) {
-      builder.bind("p" + startIndex).to(s);
-      startIndex++;
-    }
+        .append(String.format(" WHERE id='%s'", key));
     return builder.build();
   }
 
